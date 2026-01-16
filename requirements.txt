@@ -1,0 +1,15 @@
+runpod==1.7.0
+requests
+pydub
+soundfile
+
+# NeMo runtime deps (avoid the "No module named hydra" crash)
+hydra-core>=1.3.2
+omegaconf>=2.3.0
+
+# NeMo ASR (pulls the right deps)
+nemo_toolkit[asr]
+
+# Torch (pin later if you want; leaving unpinned is ok to start)
+torch
+
