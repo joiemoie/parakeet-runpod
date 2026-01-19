@@ -23,10 +23,9 @@ MODEL_PATH = os.environ.get(
 # 10 Minutes (Safe for TDT with Batch Size 2)
 CHUNK_MS_DEFAULT = int(os.environ.get("CHUNK_MS", str(10 * 60 * 1000))) 
 
-# Increased Overlap to 2.5s to improve boundary accuracy
-OVERLAP_MS_DEFAULT = int(os.environ.get("OVERLAP_MS", "2500")) 
+# Increased Overlap to 15s to improve boundary accuracy
+OVERLAP_MS_DEFAULT = int(os.environ.get("OVERLAP_MS", "15000")) 
 
-# TDT is optimized for Greedy decoding (1). 
 BEAM_SIZE_DEFAULT = int(os.environ.get("BEAM_SIZE", "1")) 
 
 MAX_SUFFIX_PREFIX_WORDS = int(os.environ.get("MAX_SUFFIX_PREFIX_WORDS", "50"))
@@ -104,11 +103,45 @@ def get_model(strategy: str, beam_size: int, enable_timestamps: bool):
             MODEL = nemo_asr.models.ASRModel.from_pretrained(model_name=path)
 
         MODEL.eval()
-
+        disable_nemo_cuda_graphs(MODEL)
         # Apply the fix immediately after loading
         unlock_and_force_tdt_config(MODEL)
 
     return MODEL
+
+def disable_nemo_cuda_graphs(model):
+    # Newer NeMo exposes the greedy decoder here
+    try:
+        dec = getattr(model, "decoding", None)
+        if dec is None:
+            return
+
+        # 1) Hard-disable via attribute (supported in docs)
+        # model.decoding.decoding is typically GreedyBatchedRNNTInfer for RNNT/TDT
+        inner = getattr(dec, "decoding", None)
+        if inner is not None:
+            if hasattr(inner, "use_cuda_graph_decoder"):
+                inner.use_cuda_graph_decoder = False
+            if hasattr(inner, "disable_cuda_graphs"):
+                inner.disable_cuda_graphs()
+
+        # 2) Also disable it in config (so future change_decoding_strategy keeps it off)
+        cfg = None
+        if hasattr(model, "cfg") and "decoding" in model.cfg:
+            cfg = model.cfg.decoding
+        elif hasattr(model, "_cfg") and "decoding" in model._cfg:
+            cfg = model._cfg.decoding
+        if cfg is not None:
+            from omegaconf import open_dict
+            with open_dict(cfg):
+                # some models put it under greedy, some directly
+                if "greedy" in cfg and "use_cuda_graph_decoder" in cfg.greedy:
+                    cfg.greedy.use_cuda_graph_decoder = False
+                if "use_cuda_graph_decoder" in cfg:
+                    cfg.use_cuda_graph_decoder = False
+
+    except Exception as e:
+        print(f"Warning: couldn't disable cuda graphs cleanly: {e}")
 
 
 def download_or_decode_audio(job_input: dict) -> str:
@@ -266,11 +299,11 @@ def transcribe_chunks_tdt_safe(model, chunk_infos, want_timestamps):
             "text": text
         })
 
-    if all_words:
-        final_text = " ".join(w["word"] for w in all_words)
-    else:
-        final_text = "\n".join(c["text"] for c in chunk_results).strip()
-
+    #if all_words:
+    #    final_text = " ".join(w["word"] for w in all_words)
+    #else:
+    #    final_text = "\n".join(c["text"] for c in chunk_results).strip()
+    final_text = "\n".join(c["text"] for c in chunk_results).strip()
     return {
         "text": final_text,
         "words": all_words,
