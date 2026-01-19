@@ -13,9 +13,11 @@ import nemo.collections.asr as nemo_asr
 from omegaconf import OmegaConf, open_dict # Required for the config fix
 
 # ====== Config ======
+HF_MODEL_NAME = os.environ.get("HF_MODEL_NAME", "nvidia/parakeet-tdt-0.6b-v2")
+
 MODEL_PATH = os.environ.get(
     "PARAKEET_NEMO_PATH",
-    "/runpod-volume/models/parakeet-tdt_ctc-1.1b.nemo",
+    HF_MODEL_NAME,
 )
 
 # 10 Minutes (Safe for TDT with Batch Size 2)
@@ -81,11 +83,26 @@ def unlock_and_force_tdt_config(model):
 def get_model(strategy: str, beam_size: int, enable_timestamps: bool):
     global MODEL
     if MODEL is None:
-        if not os.path.exists(MODEL_PATH):
-            raise FileNotFoundError(f"Model not found at {MODEL_PATH}")
+        path = MODEL_PATH
+
+        # Check runpod-volume/models cache if path is not found directly
+        if not os.path.exists(path):
+            name = path.split("/")[-1]
+            if not name.endswith(".nemo"):
+                name += ".nemo"
+            cached_path = os.path.join("runpod-volume/models", name)
+            if os.path.exists(cached_path):
+                print(f"Found cached model at {cached_path}")
+                path = cached_path
+
+        print(f"Loading model from {path}...")
         
-        print(f"Loading model from {MODEL_PATH}...")
-        MODEL = nemo_asr.models.ASRModel.restore_from(MODEL_PATH)
+        if os.path.exists(path):
+            MODEL = nemo_asr.models.ASRModel.restore_from(path)
+        else:
+            # Fallback to downloading/loading from HF Hub
+            MODEL = nemo_asr.models.ASRModel.from_pretrained(model_name=path)
+
         MODEL.eval()
 
         # Apply the fix immediately after loading
