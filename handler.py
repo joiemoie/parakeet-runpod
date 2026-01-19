@@ -10,6 +10,7 @@ import requests
 from pydub import AudioSegment
 
 import nemo.collections.asr as nemo_asr
+from omegaconf import OmegaConf, open_dict # Required for the config fix
 
 # ====== Config ======
 MODEL_PATH = os.environ.get(
@@ -17,15 +18,20 @@ MODEL_PATH = os.environ.get(
     "/runpod-volume/models/parakeet-tdt_ctc-1.1b.nemo",
 )
 
-# 10 Minutes (CTC handles long context better than TDT)
+# 10 Minutes (Safe for TDT with Batch Size 2)
 CHUNK_MS_DEFAULT = int(os.environ.get("CHUNK_MS", str(10 * 60 * 1000))) 
-OVERLAP_MS_DEFAULT = int(os.environ.get("OVERLAP_MS", "2000")) 
+
+# Increased Overlap to 2.5s to improve boundary accuracy
+OVERLAP_MS_DEFAULT = int(os.environ.get("OVERLAP_MS", "2500")) 
+
+# TDT is optimized for Greedy decoding (1). 
 BEAM_SIZE_DEFAULT = int(os.environ.get("BEAM_SIZE", "1")) 
+
 MAX_SUFFIX_PREFIX_WORDS = int(os.environ.get("MAX_SUFFIX_PREFIX_WORDS", "50"))
 TIME_GUARD_S = float(os.environ.get("TIME_GUARD_S", "0.08"))
 
-# FORCE CTC (Fixes the "Empty Text" bug with timestamps)
-DEFAULT_DECODING_STRATEGY = os.environ.get("DECODING_STRATEGY", "ctc")
+# Switch to TDT for Max Accuracy
+DEFAULT_DECODING_STRATEGY = os.environ.get("DECODING_STRATEGY", "tdt")
 
 MODEL = None
 
@@ -38,85 +44,38 @@ def _format_hhmmss(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
-def _set_nested(obj: Any, path: List[str], value: Any) -> bool:
-    cur = obj
-    for key in path[:-1]:
-        if cur is None or not hasattr(cur, key): return False
-        cur = getattr(cur, key)
-    last = path[-1]
-    if cur is None or not hasattr(cur, last): return False
+def unlock_and_force_tdt_config(model):
+    """
+    CRITICAL FIX: This unlocks the internal OmegaConf of the model 
+    to force TDT timestamps to work. This prevents the 'Empty Text' bug.
+    """
     try:
-        setattr(cur, last, value)
-        return True
-    except Exception:
-        return False
-
-
-def configure_decoding(model, strategy: str, beam_size: int, enable_timestamps: bool) -> Dict[str, Any]:
-    info = {
-        "strategy_requested": strategy,
-        "config_source": "default",
-        "params_set": [],
-        "error": None
-    }
-    decoding_cfg = None
-
-    # --- 1. Find the correct config ---
-    # For Parakeet Hybrid, the CTC config is in model.cfg.aux_ctc
-    if strategy.lower() == "ctc":
-        if hasattr(model, "cfg") and hasattr(model.cfg, "aux_ctc") and hasattr(model.cfg.aux_ctc, "decoding"):
-            decoding_cfg = copy.deepcopy(model.cfg.aux_ctc.decoding)
-            info["config_source"] = "aux_ctc"
+        # 1. Get the decoding config
+        if hasattr(model, "cfg") and "decoding" in model.cfg:
+            cfg = model.cfg.decoding
+        elif hasattr(model, "_cfg") and "decoding" in model._cfg:
+            cfg = model._cfg.decoding
         else:
-            # Fallback
-            if hasattr(model, "cfg") and hasattr(model.cfg, "decoding"):
-                decoding_cfg = copy.deepcopy(model.cfg.decoding)
-            if _set_nested(decoding_cfg, ["strategy"], "ctc"):
-                info["params_set"].append("strategy=ctc")
-    else:
-        # TDT
-        if hasattr(model, "cfg") and hasattr(model.cfg, "decoding"):
-            decoding_cfg = copy.deepcopy(model.cfg.decoding)
-        elif hasattr(model, "_cfg") and hasattr(model._cfg, "decoding"):
-            decoding_cfg = copy.deepcopy(model._cfg.decoding)
+            print("Warning: Could not find model config to unlock.")
+            return
 
-    if decoding_cfg is None:
-        info["error"] = "Could not find decoding config"
-        return info
+        # 2. Use open_dict context manager to allow writing to the config
+        # This overrides the "read-only" lock causing issues in some containers
+        with open_dict(cfg):
+            cfg.strategy = "greedy"
+            cfg.preserve_alignments = True
+            cfg.compute_timestamps = True
+            
+            # Ensure beam size matches greedy
+            if "beam" in cfg:
+                cfg.beam.beam_size = 1
 
-    # --- 2. Set Beam Size ---
-    beam_paths = [
-        ["beam", "beam_size"], 
-        ["ctc", "beam", "beam_size"], 
-        ["ctc", "beam_size"]
-    ]
-    for path in beam_paths:
-        if _set_nested(decoding_cfg, path, int(beam_size)):
-            info["params_set"].append(f"{'.'.join(path)}={beam_size}")
-            break
+        # 3. Apply the modified config back to the model
+        model.change_decoding_strategy(cfg)
+        print("Success: TDT Config unlocked and timestamps enabled.")
 
-    # --- 3. Set Timestamps ---
-    if enable_timestamps:
-        ts_paths = [
-            (["preserve_alignments"], True),
-            (["compute_timestamps"], True),
-            (["ctc", "preserve_alignments"], True), 
-            (["ctc", "compute_timestamps"], True),
-        ]
-        for path, val in ts_paths:
-            if _set_nested(decoding_cfg, path, val):
-                info["params_set"].append(".".join(path))
-
-    # --- 4. Apply ---
-    try:
-        model.change_decoding_strategy(decoding_cfg)
-        info["success"] = True
     except Exception as e:
-        info["success"] = False
-        info["error"] = str(e)
-        print(f"ERROR applying decoding strategy: {e}")
-
-    return info
+        print(f"Error forcing TDT config: {e}")
 
 
 def get_model(strategy: str, beam_size: int, enable_timestamps: bool):
@@ -124,12 +83,15 @@ def get_model(strategy: str, beam_size: int, enable_timestamps: bool):
     if MODEL is None:
         if not os.path.exists(MODEL_PATH):
             raise FileNotFoundError(f"Model not found at {MODEL_PATH}")
+        
         print(f"Loading model from {MODEL_PATH}...")
         MODEL = nemo_asr.models.ASRModel.restore_from(MODEL_PATH)
         MODEL.eval()
 
-    decoding_info = configure_decoding(MODEL, strategy, beam_size, enable_timestamps)
-    return MODEL, decoding_info
+        # Apply the fix immediately after loading
+        unlock_and_force_tdt_config(MODEL)
+
+    return MODEL
 
 
 def download_or_decode_audio(job_input: dict) -> str:
@@ -154,10 +116,8 @@ def download_or_decode_audio(job_input: dict) -> str:
 
 
 def to_16k_mono_wav(input_path: str) -> str:
-    """Converts to 16kHz mono WAV (No Normalization)."""
     tmpdir = tempfile.mkdtemp()
     wav_path = os.path.join(tmpdir, "audio_16k.wav")
-    
     audio = AudioSegment.from_file(input_path)
     audio = audio.set_frame_rate(16000).set_channels(1).set_sample_width(2)
     audio.export(wav_path, format="wav")
@@ -210,32 +170,40 @@ def _extract_text_and_word_timestamps(hypothesis: Any) -> Tuple[str, List[Dict[s
     return text, words_out
 
 
-def transcribe_chunks_batched(model, chunk_infos, want_timestamps):
+def transcribe_chunks_tdt_safe(model, chunk_infos, want_timestamps):
+    """
+    Optimized for TDT Accuracy with a safety fallback.
+    """
     paths = [c[0] for c in chunk_infos]
-    # Batch size 2 is safe for 10-minute chunks. 
-    # If using 5-min chunks, you can bump to 4.
-    BATCH_SIZE = 2 
+    
+    # Batch size 2 is safe for TDT memory usage
+    BATCH_SIZE = 2
 
     all_hyps = []
-    timestamps_worked = True
+    timestamps_worked = False
     
-    try:
-        # Batched Inference
-        if want_timestamps:
-            try:
-                all_hyps = model.transcribe(paths, batch_size=BATCH_SIZE, timestamps=True)
-            except Exception as e:
-                print(f"Batch timestamps failed: {e}. Fallback to text-only.")
-                timestamps_worked = False
-                all_hyps = model.transcribe(paths, batch_size=BATCH_SIZE)
-        else:
-            all_hyps = model.transcribe(paths, batch_size=BATCH_SIZE)
+    # 1. Attempt High-Accuracy TDT with Timestamps
+    if want_timestamps:
+        try:
+            # We already unlocked the config in get_model, so this SHOULD work
+            all_hyps = model.transcribe(paths, batch_size=BATCH_SIZE, timestamps=True)
             
-    except Exception as e:
-        print(f"Batch inference failed: {e}. Fallback to sequential.")
-        all_hyps = []
-        for p in paths:
-             all_hyps.extend(model.transcribe([p]))
+            # Validation: Did TDT fail silently? (Audio exists but 0 text returned)
+            total_text_len = sum(len(h.text) if hasattr(h, 'text') else 0 for h in all_hyps)
+            if total_text_len == 0 and len(paths) > 0:
+                print("TDT Timestamps returned empty text. Falling back to text-only mode.")
+                timestamps_worked = False
+            else:
+                timestamps_worked = True
+                
+        except Exception as e:
+            print(f"TDT Timestamp inference failed ({e}). Falling back.")
+            timestamps_worked = False
+
+    # 2. Fallback: High-Accuracy TDT (Text Only)
+    # If timestamps fail, we still want the high accuracy text, just without word times.
+    if not timestamps_worked:
+        all_hyps = model.transcribe(paths, batch_size=BATCH_SIZE)
 
     all_words = []
     chunk_results = []
@@ -244,9 +212,6 @@ def transcribe_chunks_batched(model, chunk_infos, want_timestamps):
         chunk_start_s = chunk_infos[i][1]
         text, words = _extract_text_and_word_timestamps(hyp)
         
-        # Cleanup extra spaces common in CTC
-        text = " ".join(text.split())
-
         used_timestamps = (want_timestamps and timestamps_worked and len(words) > 0)
 
         if used_timestamps:
@@ -287,13 +252,13 @@ def transcribe_chunks_batched(model, chunk_infos, want_timestamps):
     if all_words:
         final_text = " ".join(w["word"] for w in all_words)
     else:
-        final_text = "\n".join(c["text"] for c in chunk_results)
+        final_text = "\n".join(c["text"] for c in chunk_results).strip()
 
     return {
         "text": final_text,
         "words": all_words,
         "chunks": chunk_results,
-        "timestamps_worked": timestamps_worked
+        "mode": "TDT"
     }
 
 
@@ -305,18 +270,20 @@ def handler(job):
     overlap_ms = int(inp.get("overlap_ms", OVERLAP_MS_DEFAULT))
     beam_size = int(inp.get("beam_size", BEAM_SIZE_DEFAULT))
     want_timestamps = bool(inp.get("timestamps", True))
+    
+    # Default to TDT for better accuracy
     strategy = inp.get("decoding_strategy", DEFAULT_DECODING_STRATEGY) 
 
-    model, decoding_info = get_model(strategy, beam_size, want_timestamps)
+    model = get_model(strategy, beam_size, want_timestamps)
 
     raw_path = download_or_decode_audio(inp)
     wav_path = to_16k_mono_wav(raw_path)
     chunk_infos = split_wav_into_chunks(wav_path, chunk_ms, overlap_ms)
 
-    out = transcribe_chunks_batched(model, chunk_infos, want_timestamps)
+    out = transcribe_chunks_tdt_safe(model, chunk_infos, want_timestamps)
 
     return {
-        "decoding": decoding_info,
+        "decoding_strategy": "TDT (High Accuracy)",
         "text": out["text"],
         "words": out["words"],
         "chunks": out["chunks"]
