@@ -13,7 +13,7 @@ import nemo.collections.asr as nemo_asr
 from omegaconf import OmegaConf, open_dict # Required for the config fix
 
 # ====== Config ======
-HF_MODEL_NAME = os.environ.get("HF_MODEL_NAME", "nvidia/parakeet-tdt-0.6b-v2")
+HF_MODEL_NAME = os.environ.get("HF_MODEL_NAME", "nvidia/parakeet-tdt-0.6b-v3")
 
 MODEL_PATH = os.environ.get(
     "PARAKEET_NEMO_PATH",
