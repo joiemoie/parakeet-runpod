@@ -3,7 +3,9 @@ import math
 import copy
 import tempfile
 import base64
+import re
 from typing import Dict, Any, List, Tuple
+from difflib import SequenceMatcher
 
 import runpod
 import requests
@@ -198,6 +200,69 @@ def split_wav_into_chunks(wav_path: str, chunk_ms: int, overlap_ms: int) -> List
     return chunks
 
 
+_word_re = re.compile(r"[A-Za-z0-9]+(?:'[A-Za-z0-9]+)?|[^\w\s]")
+
+def tokenize_text(s: str):
+    # keeps punctuation tokens separate
+    return _word_re.findall(s)
+
+def normalize_token(t: str):
+    return re.sub(r"[^a-z0-9]+", "", t.lower())
+
+def similar(a: str, b: str) -> float:
+    return SequenceMatcher(None, a, b).ratio()
+
+def align_text_tokens_to_word_times(text: str, word_items: List[Dict[str, Any]], chunk_start_s: float):
+    """
+    Returns tokens from `text` with timestamps aligned from `word_items`.
+    Punctuation gets None times.
+    """
+    text_tokens = tokenize_text(text)
+    ts_tokens = [w["word"] for w in word_items]
+
+    # Pre-normalize
+    text_norm = [normalize_token(t) for t in text_tokens]
+    ts_norm = [normalize_token(t) for t in ts_tokens]
+
+    out = []
+    j = 0  # index in ts_tokens
+
+    for i, t in enumerate(text_tokens):
+        tn = text_norm[i]
+
+        # punctuation or empty normalization: no timestamp
+        if tn == "":
+            out.append({"token": t, "start": None, "end": None})
+            continue
+
+        # advance ts index until we find a good match
+        best_j = None
+        best_score = 0.0
+
+        # lookahead window keeps it fast and stable
+        for k in range(j, min(j + 8, len(ts_tokens))):
+            if ts_norm[k] == "":
+                continue
+            score = 1.0 if ts_norm[k] == tn else similar(ts_norm[k], tn)
+            if score > best_score:
+                best_score = score
+                best_j = k
+
+        # accept match if good enough, otherwise leave untimed
+        if best_j is not None and best_score >= 0.78:
+            w = word_items[best_j]
+            out.append({
+                "token": t,
+                "start": float(w["start"]) + chunk_start_s,
+                "end": float(w["end"]) + chunk_start_s,
+            })
+            j = best_j + 1
+        else:
+            out.append({"token": t, "start": None, "end": None})
+
+    return out
+
+
 def _extract_text_and_word_timestamps(hypothesis: Any) -> Tuple[str, List[Dict[str, Any]]]:
     if hypothesis is None: return "", []
     if isinstance(hypothesis, str): return hypothesis.strip(), []
@@ -265,12 +330,19 @@ def transcribe_chunks_tdt_safe(model, chunk_infos, want_timestamps):
         used_timestamps = (want_timestamps and timestamps_worked and len(words) > 0)
 
         if used_timestamps:
+            # words here are timestamp words (word_items)
+            aligned = align_text_tokens_to_word_times(text, words, chunk_start_s)
+
             shifted_words = []
-            for w in words:
+            # Only keep entries that are real words (not punctuation) for "word timestamps"
+            # but use the text tokens, not timestamp words, as the canonical word string.
+            for a in aligned:
+                if a["start"] is None:
+                    continue
                 shifted_words.append({
-                    "word": w["word"],
-                    "start": w["start"] + chunk_start_s,
-                    "end": w["end"] + chunk_start_s
+                    "word": a["token"],   # <-- comes from hyp.text tokenization
+                    "start": a["start"],
+                    "end": a["end"],
                 })
             
             # Dedup Suffix/Prefix
@@ -299,11 +371,7 @@ def transcribe_chunks_tdt_safe(model, chunk_infos, want_timestamps):
             "text": text
         })
 
-    #if all_words:
-    #    final_text = " ".join(w["word"] for w in all_words)
-    #else:
-    #    final_text = "\n".join(c["text"] for c in chunk_results).strip()
-    final_text = "\n".join(c["text"] for c in chunk_results).strip()
+    final_text = " ".join(c["text"].strip() for c in chunk_results if c["text"].strip())
     return {
         "text": final_text,
         "words": all_words,
